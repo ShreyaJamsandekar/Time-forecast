@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+# =============================================================================
+# overall_forecast.py
+# Standalone (no Streamlit / no UI) overall-only forecaster for GLC Sales
+# Order data -- the company-wide total, not broken out by customer/material.
+# =============================================================================
+#
+# WHAT THIS IS
+# ------------------------------------------------------------------------
+#   The simplest of the three related scripts:
+#     - production_forecasting_mvp.py  = full interactive Streamlit app
+#     - batch_forecast_comparison.py   = batch job across 800+ customer/
+#                                         material combinations, SQLite +
+#                                         one Excel file for the overall total
+#     - overall_forecast.py (this one) = JUST the overall total, no
+#                                         customer/material breakdown, no
+#                                         database -- one Excel file, in and
+#                                         out in well under a minute.
+#
+#   Forecasts the next 21 days (default) of daily Net Pounds across the
+#   whole business, using the same 4 models as the other two scripts
+#   (Seasonal Naive, AutoARIMA, AutoETS, HistGradientBoostingRegressor --
+#   Chronos-2 is not included here either), plus the average of those 4.
+#   Known future backlog (already-booked orders with a future Mat.avail.dt)
+#   is folded in as a floor, same logic as the other two scripts. Output is
+#   one Excel workbook: the forecast table (comma-formatted, no decimals)
+#   plus a backtest-accuracy sheet.
+#
+# INSTALLATION
+# ------------------------------------------------------------------------
+#   pip install pandas numpy openpyxl scikit-learn statsforecast scipy
+#
+# RUN
+# ------------------------------------------------------------------------
+#   python overall_forecast.py --workbook "Sales Order 2024-26.xlsx"
+#
+#   Flags (all optional, see --help):
+#     --excel-out overall_forecast.xlsx   output file
+#     --horizon 21                        forecast horizon in days
+#     --n-windows 8                       preferred backtest windows
+#     --thorough-arima                    full AutoARIMA search (slower,
+#                                          modestly more accurate) instead
+#                                          of the faster default
+#     --as-of YYYY-MM-DD                  historical cutoff (default: today)
+#
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import time
+import warnings
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("overall_forecast")
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+RANDOM_SEED: int = 42
+np.random.seed(RANDOM_SEED)
+
+DATE_COLUMN_NAME: str = "Mat.avail.dt"
+POUNDS_COLUMN_NAME: str = "Net Pounds"
+
+DEFAULT_HORIZON_DAYS: int = 21
+SEASONAL_PERIOD: int = 7
+ANNUAL_PERIOD: float = 365.25
+N_BACKTEST_WINDOWS_PREFERRED: int = 8
+MIN_TRAIN_DAYS: int = 60
+
+MODEL_NAMES: List[str] = ["Seasonal Naive", "AutoARIMA", "AutoETS", "HistGradientBoostingRegressor"]
+LAG_DAYS: List[int] = [1, 2, 3, 7, 14, 21, 28]
+ROLLING_WINDOWS: List[int] = [7, 14, 28]
+HGB_FEATURE_COLUMNS: List[str] = (
+    [f"lag_{l}" for l in LAG_DAYS]
+    + [f"roll_mean_{w}" for w in ROLLING_WINDOWS]
+    + ["roll_std_7", "day_of_week", "is_weekend", "month", "quarter",
+       "day_of_year", "weekly_sin", "weekly_cos", "annual_sin", "annual_cos"]
+)
+
+
+# =============================================================================
+# COLUMN / SHEET NAME NORMALIZATION (same tolerant matching as the other two scripts)
+# =============================================================================
+
+def _normalize_token(name: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).strip().lower())
+
+
+_NORM_DATE_COL = _normalize_token(DATE_COLUMN_NAME)
+_NORM_POUNDS_COL = _normalize_token(POUNDS_COLUMN_NAME)
+_HALF_YEAR_SHEET_RE = re.compile(r"^(\d{2})h(?:y)?([12])$")
+
+
+def is_half_year_sheet(sheet_name: str) -> bool:
+    return _HALF_YEAR_SHEET_RE.match(_normalize_token(sheet_name)) is not None
+
+
+def half_year_sort_key(sheet_name: str) -> Tuple[int, int]:
+    m = _HALF_YEAR_SHEET_RE.match(_normalize_token(sheet_name))
+    return (int(m.group(1)), int(m.group(2))) if m else (99, 9)
+
+
+def find_target_columns(columns: List[object]) -> Tuple[Optional[object], Optional[object]]:
+    date_col, pounds_col = None, None
+    for c in columns:
+        norm = _normalize_token(c)
+        if norm == _NORM_DATE_COL and date_col is None:
+            date_col = c
+        elif norm == _NORM_POUNDS_COL and pounds_col is None:
+            pounds_col = c
+    return date_col, pounds_col
+
+
+_NUMERIC_STRIP_RE = re.compile(r"[^0-9.\-]")
+
+
+def clean_net_pounds_value(raw: object) -> Optional[float]:
+    """Commas are thousands separators, parentheses mean negative, anything
+    unparseable returns None (never silently coerced to 0)."""
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return None
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        val = float(raw)
+        return None if np.isnan(val) else val
+    s = str(raw).strip()
+    if s == "" or s.lower() in {"nan", "none", "n/a", "na", "-"}:
+        return None
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+    s_clean = _NUMERIC_STRIP_RE.sub("", s.replace(",", "").replace(" ", ""))
+    if s_clean in {"", "-", "."} or s_clean.count(".") > 1 or s_clean.count("-") > 1:
+        return None
+    try:
+        val = float(s_clean)
+    except ValueError:
+        return None
+    return -val if negative else val
+
+
+def load_overall_daily_series(path: Union[str, Path]) -> pd.Series:
+    """Read every half-year sheet, clean it, and return ONE dense daily
+    Net Pounds series across the whole company (true calendar gaps left
+    as NaN, filled in later only for model fitting).
+
+    Duplicate detection compares the FULL original row (every column from
+    the sheet, not just date + Net Pounds) -- comparing only date+pounds
+    would wrongly flag two different orders from different customers as
+    "duplicates" just because they happened to ship the same quantity on
+    the same day, silently deleting real volume. Matches the dedup logic
+    in batch_forecast_comparison.py exactly.
+    """
+    raw_sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    matched = {name: df for name, df in raw_sheets.items() if is_half_year_sheet(name)}
+    matched = dict(sorted(matched.items(), key=lambda kv: half_year_sort_key(kv[0])))
+    if not matched:
+        raise ValueError(
+            f"No sheets matching the half-year naming convention (e.g. '24HY1', '24H2') found. "
+            f"Sheets present: {list(raw_sheets.keys())}"
+        )
+    log.info("Matched %d half-year sheet(s): %s", len(matched), list(matched.keys()))
+
+    frames = []
+    total_loaded = total_invalid_date = total_invalid_pounds = 0
+    for sheet_name, df in matched.items():
+        date_col, pounds_col = find_target_columns(list(df.columns))
+        if date_col is None or pounds_col is None:
+            log.warning("Sheet '%s': could not find date/Net Pounds columns -- skipped.", sheet_name)
+            continue
+        working = df.copy()  # keep every original column -- needed for correct row-level dedup below
+        working["__date__"] = pd.to_datetime(working[date_col], errors="coerce")
+        working["__net_pounds__"] = working[pounds_col].apply(clean_net_pounds_value)
+        invalid_date, invalid_pounds = working["__date__"].isna(), working["__net_pounds__"].isna()
+        total_loaded += len(working)
+        total_invalid_date += int(invalid_date.sum())
+        total_invalid_pounds += int(invalid_pounds.sum())
+
+        clean = working.loc[~(invalid_date | invalid_pounds)].copy()
+        clean["date"] = clean["__date__"].dt.normalize()
+        clean["net_pounds"] = clean["__net_pounds__"]
+        clean = clean.drop(columns=["__date__", "__net_pounds__"])
+        clean["__sheet__"] = sheet_name
+        frames.append(clean)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame(columns=["date", "net_pounds"])
+    if combined.empty:
+        raise ValueError("No valid rows survived cleaning across all sheets.")
+
+    dedup_cols = [c for c in combined.columns if c != "__sheet__"]
+    dup_count = int(combined.duplicated(subset=dedup_cols, keep="first").sum())
+    combined = combined.loc[~combined.duplicated(subset=dedup_cols, keep="first")].copy()
+    log.info(
+        "Cleaning summary: %d rows loaded, %d invalid dates, %d invalid Net Pounds, "
+        "%d exact-duplicate rows removed, %d valid rows remain.",
+        total_loaded, total_invalid_date, total_invalid_pounds, dup_count, len(combined),
+    )
+
+    daily = combined.groupby("date")["net_pounds"].sum().sort_index()
+    daily.index = pd.DatetimeIndex(daily.index)
+    full_index = pd.date_range(daily.index.min(), daily.index.max(), freq="D")
+    return daily.reindex(full_index)  # dense, true gaps as NaN
+
+
+# =============================================================================
+# HISTORICAL / KNOWN-BACKLOG SPLIT (same logic as the other two scripts)
+# =============================================================================
+
+def historical_slice(dense_series: pd.Series, as_of_date: pd.Timestamp) -> pd.Series:
+    return dense_series.loc[dense_series.index <= as_of_date]
+
+
+def backlog_slice(dense_series: pd.Series, as_of_date: pd.Timestamp) -> pd.Series:
+    return dense_series.loc[dense_series.index > as_of_date]
+
+
+def modeling_series_for(historical: pd.Series) -> pd.Series:
+    return historical.interpolate(method="linear", limit_direction="both")
+
+
+def achievable_n_windows(n_obs: int, horizon: int, min_train: int = MIN_TRAIN_DAYS,
+                          preferred: int = N_BACKTEST_WINDOWS_PREFERRED) -> int:
+    if n_obs < min_train + horizon:
+        return 0
+    return max(1, min(preferred, (n_obs - min_train) // horizon))
+
+
+# =============================================================================
+# METRICS
+# =============================================================================
+
+def compute_wape(y_true, y_pred) -> float:
+    denom = np.sum(np.abs(y_true))
+    return np.nan if denom == 0 else 100.0 * np.sum(np.abs(y_true - y_pred)) / denom
+
+
+def compute_mae(y_true, y_pred) -> float:
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def compute_rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def compute_smape(y_true, y_pred) -> float:
+    denom = np.abs(y_true) + np.abs(y_pred)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(denom == 0, 0.0, 2.0 * np.abs(y_true - y_pred) / denom)
+    return 100.0 * float(np.mean(ratio))
+
+
+def compute_mase(y_true, y_pred, in_sample_history: np.ndarray, seasonal_period: int = SEASONAL_PERIOD) -> float:
+    if len(in_sample_history) <= seasonal_period:
+        return np.nan
+    naive_errors = np.abs(in_sample_history[seasonal_period:] - in_sample_history[:-seasonal_period])
+    scale = np.mean(naive_errors)
+    return np.nan if scale == 0 else float(np.mean(np.abs(y_true - y_pred)) / scale)
+
+
+def compute_bias(y_true, y_pred) -> float:
+    return float(np.mean(y_pred - y_true))
+
+
+def compute_abs_pct_bias(y_true, y_pred) -> float:
+    total_true = np.sum(y_true)
+    return np.nan if total_true == 0 else 100.0 * abs(np.sum(y_pred) - total_true) / abs(total_true)
+
+
+def wape_based_accuracy(wape: float) -> float:
+    return np.nan if np.isnan(wape) else max(0.0, 100.0 - wape)
+
+
+@dataclass
+class ModelMetrics:
+    model_name: str
+    wape: float = np.nan
+    mae: float = np.nan
+    rmse: float = np.nan
+    smape: float = np.nan
+    mase: float = np.nan
+    bias: float = np.nan
+    abs_pct_bias: float = np.nan
+    accuracy_score: float = np.nan
+    n_success_windows: int = 0
+    n_failed_windows: int = 0
+    skipped: bool = False
+    skip_reason: str = ""
+
+
+def metrics_from_windows(model_name: str, y_true_list: List[np.ndarray], y_pred_list: List[np.ndarray],
+                          n_failed: int, full_history: np.ndarray) -> ModelMetrics:
+    if not y_true_list:
+        return ModelMetrics(model_name, n_failed_windows=n_failed, skipped=True,
+                             skip_reason="No successful backtest windows (insufficient history).")
+    y_true, y_pred = np.concatenate(y_true_list), np.concatenate(y_pred_list)
+    n_success = len(y_true_list)
+    failure_rate = n_failed / (n_failed + n_success) if (n_failed + n_success) else 0.0
+    wape = compute_wape(y_true, y_pred)
+    m = ModelMetrics(
+        model_name=model_name, wape=wape, mae=compute_mae(y_true, y_pred), rmse=compute_rmse(y_true, y_pred),
+        smape=compute_smape(y_true, y_pred), mase=compute_mase(y_true, y_pred, full_history),
+        bias=compute_bias(y_true, y_pred), abs_pct_bias=compute_abs_pct_bias(y_true, y_pred),
+        accuracy_score=wape_based_accuracy(wape), n_success_windows=n_success, n_failed_windows=n_failed,
+    )
+    if failure_rate > 0.20:
+        m.skipped, m.skip_reason = True, f"{n_failed} of {n_failed + n_success} backtest windows failed (>20%)."
+    return m
+
+
+# =============================================================================
+# HistGradientBoostingRegressor
+# =============================================================================
+
+def sunday_start_dow(index: pd.DatetimeIndex) -> np.ndarray:
+    """Day-of-week with the week running Sunday(0)..Saturday(6), instead of
+    pandas' default Monday(0)..Sunday(6). Embedded everywhere a 'day of
+    week' or 'week' concept is used, so the week convention is always
+    Sun-Sat without needing to pass a flag around."""
+    return (index.dayofweek + 1) % 7
+
+
+def week_start_date(d: pd.Timestamp) -> pd.Timestamp:
+    """The Sunday that begins d's Sun-Sat week."""
+    return d - pd.Timedelta(days=int((d.dayofweek + 1) % 7))
+
+
+def build_hgb_features(series: pd.Series) -> pd.DataFrame:
+    df = pd.DataFrame({"y": series.astype(float)})
+    df.index = pd.DatetimeIndex(df.index)
+    shifted = df["y"].shift(1)
+    for lag in LAG_DAYS:
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+    for window in ROLLING_WINDOWS:
+        df[f"roll_mean_{window}"] = shifted.rolling(window, min_periods=max(2, window // 2)).mean()
+    df["roll_std_7"] = shifted.rolling(7, min_periods=3).std()
+    dow, doy = sunday_start_dow(df.index), df.index.dayofyear
+    df["day_of_week"] = dow  # 0=Sunday ... 6=Saturday
+    df["is_weekend"] = ((dow == 0) | (dow == 6)).astype(int)
+    df["month"] = df.index.month
+    df["quarter"] = df.index.quarter
+    df["day_of_year"] = doy
+    df["weekly_sin"] = np.sin(2 * np.pi * dow / SEASONAL_PERIOD)
+    df["weekly_cos"] = np.cos(2 * np.pi * dow / SEASONAL_PERIOD)
+    df["annual_sin"] = np.sin(2 * np.pi * doy / ANNUAL_PERIOD)
+    df["annual_cos"] = np.cos(2 * np.pi * doy / ANNUAL_PERIOD)
+    return df
+
+
+def fit_hgb(train: pd.Series):
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    features = build_hgb_features(train.dropna())
+    rows = features.dropna(subset=HGB_FEATURE_COLUMNS)
+    if len(rows) < 30:
+        return None
+    model = HistGradientBoostingRegressor(random_state=RANDOM_SEED, min_samples_leaf=5)
+    model.fit(rows[HGB_FEATURE_COLUMNS].to_numpy(), rows["y"].to_numpy())
+    return model
+
+
+def predict_hgb(model, history: pd.Series, horizon: int, future_dates: List[pd.Timestamp]) -> np.ndarray:
+    if model is None:
+        return np.full(horizon, np.nan)
+    working = history.copy()
+    preds = []
+    for target_date in future_dates:
+        working = working.reindex(pd.date_range(working.index.min(), target_date, freq="D"))
+        feats = build_hgb_features(working)
+        row = feats.loc[[target_date], HGB_FEATURE_COLUMNS].fillna(0.0)
+        pred = max(0.0, float(model.predict(row.to_numpy())[0]))
+        preds.append(pred)
+        working.loc[target_date] = pred
+    return np.array(preds)
+
+
+def backtest_hgb(modeling_series: pd.Series, horizon: int) -> ModelMetrics:
+    n_windows = achievable_n_windows(len(modeling_series), horizon)
+    if n_windows == 0:
+        return ModelMetrics("HistGradientBoostingRegressor", skipped=True,
+                             skip_reason="Not enough history for the chosen horizon.")
+    y_true_list, y_pred_list, n_failed = [], [], 0
+    for k in range(n_windows, 0, -1):
+        train_len = len(modeling_series) - horizon * k
+        train = modeling_series.iloc[:train_len]
+        test = modeling_series.iloc[train_len: train_len + horizon]
+        if len(test) < horizon:
+            continue
+        try:
+            model = fit_hgb(train)
+            preds = predict_hgb(model, train, horizon, list(test.index))
+            if model is None or np.any(np.isnan(preds)):
+                n_failed += 1
+            else:
+                y_true_list.append(test.to_numpy())
+                y_pred_list.append(preds)
+        except Exception:
+            n_failed += 1
+    return metrics_from_windows("HistGradientBoostingRegressor", y_true_list, y_pred_list, n_failed,
+                                 modeling_series.values)
+
+
+# =============================================================================
+# Seasonal Naive, AutoARIMA, AutoETS -- single series, no need for the
+# multi-segment vectorized bucketing the batch script uses (that trick is
+# only necessary at 800+-segment scale).
+# =============================================================================
+
+def _build_statsforecast_models(fast_arima: bool):
+    from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive
+    arima_kwargs = dict(season_length=SEASONAL_PERIOD)
+    if fast_arima:
+        arima_kwargs.update(approximation=True, max_order=3, max_p=2, max_q=2, max_P=1, max_Q=1)
+    return [
+        SeasonalNaive(season_length=SEASONAL_PERIOD),
+        AutoARIMA(**arima_kwargs),
+        AutoETS(season_length=SEASONAL_PERIOD),
+    ]
+
+
+_STATSFORECAST_MODEL_NAMES = {"SeasonalNaive": "Seasonal Naive", "AutoARIMA": "AutoARIMA", "AutoETS": "AutoETS"}
+
+
+def backtest_statsforecast_models(modeling_series: pd.Series, horizon: int, preferred_windows: int,
+                                   fast_arima: bool) -> Dict[str, ModelMetrics]:
+    from statsforecast import StatsForecast
+
+    n_windows = achievable_n_windows(len(modeling_series.dropna()), horizon, preferred=preferred_windows)
+    if n_windows == 0:
+        return {name: ModelMetrics(name, skipped=True, skip_reason="Not enough history for the chosen horizon.")
+                for name in _STATSFORECAST_MODEL_NAMES.values()}
+
+    df = pd.DataFrame({"unique_id": "overall", "ds": modeling_series.dropna().index, "y": modeling_series.dropna().values})
+    sf = StatsForecast(models=_build_statsforecast_models(fast_arima), freq="D", n_jobs=1)
+    try:
+        cv = sf.cross_validation(df=df, h=horizon, n_windows=n_windows, step_size=horizon)
+    except Exception as exc:
+        log.warning("Backtest failed: %s", exc)
+        return {name: ModelMetrics(name, skipped=True, skip_reason=f"Backtest error: {exc}")
+                for name in _STATSFORECAST_MODEL_NAMES.values()}
+
+    full_hist = modeling_series.dropna().values
+    results = {}
+    for col, name in _STATSFORECAST_MODEL_NAMES.items():
+        if col not in cv.columns:
+            results[name] = ModelMetrics(name, skipped=True, skip_reason="Model column missing from output.")
+            continue
+        y_true_list, y_pred_list, n_failed = [], [], 0
+        for _, window_df in cv.groupby("cutoff"):
+            y_true_w, y_pred_w = window_df["y"].to_numpy(), window_df[col].to_numpy()
+            valid = ~np.isnan(y_pred_w)
+            if valid.sum() == 0:
+                n_failed += 1
+            else:
+                y_true_list.append(y_true_w[valid])
+                y_pred_list.append(y_pred_w[valid])
+        results[name] = metrics_from_windows(name, y_true_list, y_pred_list, n_failed, full_hist)
+    return results
+
+
+def forecast_statsforecast_models(modeling_series: pd.Series, horizon: int,
+                                   fast_arima: bool) -> Dict[str, np.ndarray]:
+    from statsforecast import StatsForecast
+
+    df = pd.DataFrame({"unique_id": "overall", "ds": modeling_series.dropna().index, "y": modeling_series.dropna().values})
+    sf = StatsForecast(models=_build_statsforecast_models(fast_arima), freq="D", n_jobs=1)
+    fc = sf.forecast(df=df, h=horizon, level=[80])
+    out = {}
+    for col, name in _STATSFORECAST_MODEL_NAMES.items():
+        if col in fc.columns:
+            out[name] = np.maximum(fc[col].to_numpy(), 0.0)
+    return out
+
+
+# =============================================================================
+# EXCEL OUTPUT
+# =============================================================================
+
+def build_weekly_rollup(forecast_df: pd.DataFrame) -> pd.DataFrame:
+    """Sum the daily forecast into Sun-Sat weekly totals. Robust to a
+    horizon that isn't a multiple of 7 and a start date that isn't a
+    Sunday -- the first/last week may be partial, so 'days_in_week' is
+    included so a partial week's lower total isn't misread as a dip."""
+    df = forecast_df.copy()
+    df["forecast_date"] = pd.to_datetime(df["forecast_date"])
+    df["week_start"] = df["forecast_date"].apply(week_start_date).dt.date
+    value_cols = MODEL_NAMES + ["Average", "known_backlog"]
+    weekly = df.groupby("week_start").agg({**{c: "sum" for c in value_cols}, "forecast_date": "count"})
+    weekly = weekly.rename(columns={"forecast_date": "days_in_week", "known_backlog": "Known Backlog"})
+    weekly = weekly.reset_index().rename(columns={"week_start": "Week Start (Sunday)"})
+    weekly["Week End (Saturday)"] = pd.to_datetime(weekly["Week Start (Sunday)"]) + pd.Timedelta(days=6)
+    weekly["Week End (Saturday)"] = weekly["Week End (Saturday)"].dt.date
+    cols = ["Week Start (Sunday)", "Week End (Saturday)", "days_in_week"] + MODEL_NAMES + ["Average", "Known Backlog"]
+    return weekly[cols]
+
+
+def write_excel(forecast_df: pd.DataFrame, metrics: List[ModelMetrics], out_path: Union[str, Path]) -> None:
+    from openpyxl.styles import Font
+
+    display_cols = ["forecast_date"] + MODEL_NAMES + ["Average", "known_backlog"]
+    df = forecast_df[display_cols].rename(columns={"known_backlog": "Known Backlog"})
+    weekly_df = build_weekly_rollup(forecast_df)
+    metrics_df = pd.DataFrame([{
+        "model": m.model_name, "wape": m.wape, "mae": m.mae, "rmse": m.rmse, "smape": m.smape,
+        "mase": m.mase, "bias": m.bias, "accuracy_score": m.accuracy_score,
+        "n_success_windows": m.n_success_windows, "n_failed_windows": m.n_failed_windows,
+        "skipped": m.skipped, "skip_reason": m.skip_reason,
+    } for m in metrics]).sort_values("wape")
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Overall Forecast (Daily)", index=False)
+        weekly_df.to_excel(writer, sheet_name="Overall Forecast (Weekly)", index=False)
+        metrics_df.to_excel(writer, sheet_name="Backtest Accuracy", index=False)
+
+        for sheet_name, ncols, nrows, first_value_col in [
+            ("Overall Forecast (Daily)", len(display_cols), len(df), 2),
+            ("Overall Forecast (Weekly)", len(weekly_df.columns), len(weekly_df), 4),
+        ]:
+            ws = writer.sheets[sheet_name]
+            for col_i in range(first_value_col, ncols + 1):
+                for row_i in range(2, nrows + 2):
+                    ws.cell(row=row_i, column=col_i).number_format = "#,##0"
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+        for cell in writer.sheets["Backtest Accuracy"][1]:
+            cell.font = Font(bold=True)
+
+
+def resolve_forecast_start(as_of: pd.Timestamp, align_to_sunday: bool) -> pd.Timestamp:
+    """The first day of the forecast. Default: the day right after as_of,
+    whatever weekday that is (the weekly rollup sheet just buckets whatever
+    days land where, first/last bucket possibly partial). If
+    align_to_sunday=True, skip forward to the next Sunday on/after that so
+    every week in the output is a clean full Sun-Sat week."""
+    tomorrow = as_of + pd.Timedelta(days=1)
+    if not align_to_sunday:
+        return tomorrow
+    days_ahead = (6 - tomorrow.dayofweek) % 7  # pandas: Monday=0 ... Sunday=6
+    return tomorrow + pd.Timedelta(days=days_ahead)
+
+
+# =============================================================================
+# MAIN ORCHESTRATION
+# =============================================================================
+
+def run(
+    workbook_path: Union[str, Path], excel_out_path: Union[str, Path],
+    horizon: int = DEFAULT_HORIZON_DAYS, preferred_windows: int = N_BACKTEST_WINDOWS_PREFERRED,
+    fast_arima: bool = True, as_of: Optional[pd.Timestamp] = None, align_to_sunday: bool = False,
+) -> None:
+    t0 = time.time()
+    as_of = as_of or pd.Timestamp(date.today())
+
+    log.info("Loading workbook: %s", workbook_path)
+    dense = load_overall_daily_series(workbook_path)
+
+    historical = historical_slice(dense, as_of)
+    backlog = backlog_slice(dense, as_of)
+    if historical.dropna().empty:
+        raise ValueError(f"No historical data on or before {as_of.date()}.")
+    modeling = modeling_series_for(historical)
+    log.info("Historical days: %d, known backlog days ahead: %d", len(historical), int((~backlog.isna()).sum()))
+
+    log.info("Backtesting Seasonal Naive / AutoARIMA / AutoETS...")
+    sf_metrics = backtest_statsforecast_models(modeling, horizon, preferred_windows, fast_arima)
+    log.info("Backtesting HistGradientBoostingRegressor...")
+    hgb_metrics = backtest_hgb(modeling, horizon)
+    all_metrics = [sf_metrics[name] for name in ["Seasonal Naive", "AutoARIMA", "AutoETS"]] + [hgb_metrics]
+    for m in all_metrics:
+        status = f"SKIPPED ({m.skip_reason})" if m.skipped else f"WAPE={m.wape:.1f}"
+        log.info("  %-32s %s", m.model_name, status)
+
+    log.info("Fitting final models on full history and forecasting %d days ahead...", horizon)
+    # Forecast dates are anchored to as_of (not to this series' own last actual
+    # observation) -- a sparse tail (no orders in the last few days before
+    # as_of) would otherwise shift the forecast window earlier than intended.
+    # modeling_series_for() already interpolates through to as_of, so this is safe.
+    forecast_start = resolve_forecast_start(as_of, align_to_sunday)
+    future_dates = pd.date_range(forecast_start, periods=horizon, freq="D")
+
+    sf_forecast = forecast_statsforecast_models(modeling, horizon, fast_arima)
+    hgb_model = fit_hgb(modeling)
+    hgb_forecast = predict_hgb(hgb_model, modeling, horizon, list(future_dates))
+    model_forecasts = dict(sf_forecast)
+    model_forecasts["HistGradientBoostingRegressor"] = hgb_forecast
+
+    rows = []
+    for i, d in enumerate(future_dates):
+        backlog_val = float(backlog.get(d, 0.0)) if not pd.isna(backlog.get(d, 0.0)) else 0.0
+        row = {"forecast_date": d.date(), "known_backlog": backlog_val}
+        vals = []
+        for name in MODEL_NAMES:
+            raw = model_forecasts.get(name)
+            if raw is not None and not np.isnan(raw[i]):
+                combined = max(float(raw[i]), backlog_val)  # backlog is a floor, same as the other two scripts
+                row[name] = combined
+                vals.append(combined)
+            else:
+                row[name] = np.nan
+        row["Average"] = float(np.mean(vals)) if vals else np.nan
+        rows.append(row)
+    forecast_df = pd.DataFrame(rows)
+
+    write_excel(forecast_df, all_metrics, excel_out_path)
+    log.info("Done in %.1fs. Wrote %s.", time.time() - t0, excel_out_path)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--workbook", default="Sales Order 2024-26.xlsx", help="Path to the Sales Order workbook.")
+    p.add_argument("--excel-out", default="overall_forecast.xlsx", help="Output Excel file.")
+    p.add_argument("--horizon", type=int, default=DEFAULT_HORIZON_DAYS, help="Forecast horizon in days.")
+    p.add_argument("--n-windows", type=int, default=N_BACKTEST_WINDOWS_PREFERRED, help="Preferred backtest windows.")
+    p.add_argument("--thorough-arima", action="store_true",
+                    help="Use AutoARIMA's full search instead of the faster reduced-search default.")
+    p.add_argument("--as-of", default=None, help="Historical cutoff date (YYYY-MM-DD). Defaults to today.")
+    p.add_argument("--align-to-sunday", action="store_true",
+                    help="Start the forecast on the next Sunday on/after as-of, so every week in the "
+                         "weekly rollup sheet is a clean full Sun-Sat week. Default: start the day "
+                         "right after as-of, whatever weekday that is (first/last week may be partial).")
+    return p
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+    as_of = pd.Timestamp(args.as_of) if args.as_of else None
+    run(
+        workbook_path=args.workbook, excel_out_path=args.excel_out, horizon=args.horizon,
+        preferred_windows=args.n_windows, fast_arima=not args.thorough_arima, as_of=as_of,
+        align_to_sunday=args.align_to_sunday,
+    )
+
+
+if __name__ == "__main__":
+    main()
