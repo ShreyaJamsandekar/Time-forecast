@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+# =============================================================================
+# customer_material_forecast.py
+# Standalone (no Streamlit / no UI) forecaster: one chosen model, every
+# customer/material combination, wide date-column output for comparing
+# against your own existing "locality forecast".
+# =============================================================================
+#
+# WHAT THIS IS
+# ------------------------------------------------------------------------
+#   The third of three related scripts:
+#     - production_forecasting_mvp.py    = full interactive Streamlit app
+#     - overall_forecast.py               = company-wide total only
+#     - batch_forecast_comparison.py      = all 4 models + backtest accuracy,
+#                                            per customer/material, in SQLite
+#     - customer_material_forecast.py (this one) = ONE model you choose,
+#       every customer/material combination, NO backtesting (by design --
+#       you're comparing forecast numbers against your own predictions, not
+#       scoring accuracy here), output as one wide Excel sheet: one row per
+#       customer/material, one column per forecast date.
+#
+#   No backtesting means each segment only needs a single fit + forecast
+#   instead of 8, which is what makes ~9,000+ segments practical to run in
+#   one sitting. AutoARIMA/AutoETS/Seasonal Naive are additionally
+#   vectorized across ALL segments in one call (statsforecast's native
+#   panel forecast()) rather than looped one at a time -- the same trick
+#   batch_forecast_comparison.py uses for its backtest.
+#
+# INSTALLATION
+# ------------------------------------------------------------------------
+#   pip install pandas numpy openpyxl scikit-learn statsforecast scipy
+#
+# RUN
+# ------------------------------------------------------------------------
+#   python customer_material_forecast.py --workbook "Sales Order 2024-26.xlsx" --model AutoARIMA
+#
+#   Flags (see --help for the full list):
+#     --model {Seasonal Naive,AutoARIMA,AutoETS,HistGradientBoostingRegressor,Average}
+#                                     which forecast to put in the output (default: Average,
+#                                     which needs all 4 models computed -- slower than picking one)
+#     --excel-out customer_material_forecast.xlsx
+#     --horizon 21                   forecast horizon in days
+#     --align-to-sunday              start the forecast on the next Sunday instead of tomorrow
+#                                     (see overall_forecast.py's flag of the same name)
+#     --thorough-arima / --fast-arima   AutoARIMA search depth (default: thorough here, since
+#                                     skipping the backtest already saves ~8x -- see below)
+#     --n-jobs -1                    CPU cores for the vectorized statsforecast call
+#     --limit 50                     only process the first N segments (quick timing test)
+#     --as-of YYYY-MM-DD             historical cutoff (default: today)
+#
+# ON ACCURACY VS. SPEED
+# ------------------------------------------------------------------------
+#   Because there's no backtest, AutoARIMA's default here is the THOROUGH
+#   search (the other two scripts default to a faster reduced search,
+#   because they pay that cost 8 times per segment for the backtest --
+#   this script pays it once). If --model AutoARIMA or --model Average is
+#   still too slow across your full segment count, --fast-arima trades some
+#   accuracy for a ~5-6x speedup (measured in batch_forecast_comparison.py's
+#   benchmarking). Seasonal Naive, AutoETS, and HistGradientBoostingRegressor
+#   are all much cheaper per segment than AutoARIMA regardless of this flag
+#   -- if runtime is tight, picking one of those instead of AutoARIMA/Average
+#   is the bigger lever. Run with --limit 50 first to get a real per-segment
+#   timing on your own hardware before committing to the full run.
+#
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import time
+import warnings
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("customer_material_forecast")
+
+# =============================================================================
+# CONFIG (kept in sync with the other two scripts)
+# =============================================================================
+
+RANDOM_SEED: int = 42
+np.random.seed(RANDOM_SEED)
+
+DATE_COLUMN_NAME: str = "Mat.avail.dt"
+POUNDS_COLUMN_NAME: str = "Net Pounds"
+CUSTOMER_COLUMN_ALIASES: List[str] = [
+    "customer", "cg3", "customer group 3", "customergroup3", "cust group 3",
+    "customer group", "sold to party", "soldtoparty", "sold to", "customer name",
+]
+MATERIAL_GROUP_COLUMN_ALIASES: List[str] = [
+    "material group", "materialgroup", "matl group", "mat group", "material grp",
+    "matgroup", "product group", "productgroup", "material category",
+]
+
+DEFAULT_HORIZON_DAYS: int = 21
+SEASONAL_PERIOD: int = 7
+ANNUAL_PERIOD: float = 365.25
+MIN_FIT_DAYS: int = 21  # absolute floor to even attempt a fit/forecast
+
+MODEL_CHOICES: List[str] = ["Seasonal Naive", "AutoARIMA", "AutoETS", "HistGradientBoostingRegressor", "Average"]
+STATSFORECAST_MODELS: List[str] = ["Seasonal Naive", "AutoARIMA", "AutoETS"]
+
+LAG_DAYS: List[int] = [1, 2, 3, 7, 14, 21, 28]
+ROLLING_WINDOWS: List[int] = [7, 14, 28]
+HGB_FEATURE_COLUMNS: List[str] = (
+    [f"lag_{l}" for l in LAG_DAYS]
+    + [f"roll_mean_{w}" for w in ROLLING_WINDOWS]
+    + ["roll_std_7", "day_of_week", "is_weekend", "month", "quarter",
+       "day_of_year", "weekly_sin", "weekly_cos", "annual_sin", "annual_cos"]
+)
+
+
+# =============================================================================
+# COLUMN / SHEET NAME NORMALIZATION
+# =============================================================================
+
+def _normalize_token(name: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).strip().lower())
+
+
+_NORM_DATE_COL = _normalize_token(DATE_COLUMN_NAME)
+_NORM_POUNDS_COL = _normalize_token(POUNDS_COLUMN_NAME)
+_NORM_CUSTOMER_ALIASES = {_normalize_token(a) for a in CUSTOMER_COLUMN_ALIASES}
+_NORM_MATERIAL_GROUP_ALIASES = {_normalize_token(a) for a in MATERIAL_GROUP_COLUMN_ALIASES}
+_HALF_YEAR_SHEET_RE = re.compile(r"^(\d{2})h(?:y)?([12])$")
+
+
+def is_half_year_sheet(sheet_name: str) -> bool:
+    return _HALF_YEAR_SHEET_RE.match(_normalize_token(sheet_name)) is not None
+
+
+def half_year_sort_key(sheet_name: str) -> Tuple[int, int]:
+    m = _HALF_YEAR_SHEET_RE.match(_normalize_token(sheet_name))
+    return (int(m.group(1)), int(m.group(2))) if m else (99, 9)
+
+
+def find_target_columns(columns: List[object]) -> Tuple[Optional[object], Optional[object]]:
+    date_col, pounds_col = None, None
+    for c in columns:
+        norm = _normalize_token(c)
+        if norm == _NORM_DATE_COL and date_col is None:
+            date_col = c
+        elif norm == _NORM_POUNDS_COL and pounds_col is None:
+            pounds_col = c
+    return date_col, pounds_col
+
+
+def find_segment_columns(columns: List[object]) -> Tuple[Optional[object], Optional[object]]:
+    customer_col, material_col = None, None
+    for c in columns:
+        norm = _normalize_token(c)
+        if norm in _NORM_CUSTOMER_ALIASES and customer_col is None:
+            customer_col = c
+        elif norm in _NORM_MATERIAL_GROUP_ALIASES and material_col is None:
+            material_col = c
+    return customer_col, material_col
+
+
+_NUMERIC_STRIP_RE = re.compile(r"[^0-9.\-]")
+
+
+def clean_net_pounds_value(raw: object) -> Optional[float]:
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return None
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        val = float(raw)
+        return None if np.isnan(val) else val
+    s = str(raw).strip()
+    if s == "" or s.lower() in {"nan", "none", "n/a", "na", "-"}:
+        return None
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+    s_clean = _NUMERIC_STRIP_RE.sub("", s.replace(",", "").replace(" ", ""))
+    if s_clean in {"", "-", "."} or s_clean.count(".") > 1 or s_clean.count("-") > 1:
+        return None
+    try:
+        val = float(s_clean)
+    except ValueError:
+        return None
+    return -val if negative else val
+
+
+def load_and_clean_workbook(path: Union[str, Path]) -> pd.DataFrame:
+    """Read every half-year sheet, clean it, and return one combined
+    dataframe with standardized columns: date, net_pounds, customer,
+    material_group. Duplicate detection compares the FULL original row
+    (every column, not just date+Net Pounds) -- see overall_forecast.py's
+    header notes for why that distinction matters."""
+    raw_sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    matched = {name: df for name, df in raw_sheets.items() if is_half_year_sheet(name)}
+    matched = dict(sorted(matched.items(), key=lambda kv: half_year_sort_key(kv[0])))
+    if not matched:
+        raise ValueError(
+            f"No sheets matching the half-year naming convention (e.g. '24HY1', '24H2') found. "
+            f"Sheets present: {list(raw_sheets.keys())}"
+        )
+    log.info("Matched %d half-year sheet(s): %s", len(matched), list(matched.keys()))
+
+    cleaned_frames = []
+    total_loaded = total_invalid_date = total_invalid_pounds = 0
+    for sheet_name, df in matched.items():
+        date_col, pounds_col = find_target_columns(list(df.columns))
+        if date_col is None or pounds_col is None:
+            log.warning("Sheet '%s': could not find date/Net Pounds columns -- skipped.", sheet_name)
+            continue
+        working = df.copy()
+        working["__date__"] = pd.to_datetime(working[date_col], errors="coerce")
+        working["__net_pounds__"] = working[pounds_col].apply(clean_net_pounds_value)
+        invalid_date = working["__date__"].isna()
+        invalid_pounds = working["__net_pounds__"].isna()
+        total_loaded += len(working)
+        total_invalid_date += int(invalid_date.sum())
+        total_invalid_pounds += int(invalid_pounds.sum())
+
+        clean = working.loc[~(invalid_date | invalid_pounds)].copy()
+        clean["date"] = clean["__date__"].dt.normalize()
+        clean["net_pounds"] = clean["__net_pounds__"]
+        clean = clean.drop(columns=["__date__", "__net_pounds__"])
+
+        customer_col, material_col = find_segment_columns(list(df.columns))
+        if customer_col is not None:
+            clean["customer"] = clean[customer_col].astype(str).str.strip()
+        if material_col is not None:
+            clean["material_group"] = clean[material_col].astype(str).str.strip()
+        clean["__sheet__"] = sheet_name
+        cleaned_frames.append(clean)
+
+    combined = pd.concat(cleaned_frames, ignore_index=True, sort=False) if cleaned_frames else pd.DataFrame()
+    if combined.empty:
+        raise ValueError("No valid rows survived cleaning across all sheets.")
+
+    dedup_cols = [c for c in combined.columns if c != "__sheet__"]
+    dup_count = int(combined.duplicated(subset=dedup_cols, keep="first").sum())
+    combined = combined.loc[~combined.duplicated(subset=dedup_cols, keep="first")].copy()
+
+    log.info(
+        "Cleaning summary: %d rows loaded, %d invalid dates, %d invalid Net Pounds, "
+        "%d exact-duplicate rows removed, %d valid rows remain.",
+        total_loaded, total_invalid_date, total_invalid_pounds, dup_count, len(combined),
+    )
+    if "customer" not in combined.columns or "material_group" not in combined.columns:
+        raise ValueError(
+            "No customer / material group columns were recognized in this workbook. "
+            "Add your exact header text to CUSTOMER_COLUMN_ALIASES / "
+            "MATERIAL_GROUP_COLUMN_ALIASES near the top of this file."
+        )
+    return combined
+
+
+# =============================================================================
+# SEGMENT ENUMERATION + AGGREGATION
+# =============================================================================
+
+@dataclass
+class Segment:
+    customer: str
+    material_group: str
+
+
+def enumerate_segments(combined: pd.DataFrame, limit: Optional[int] = None) -> List[Segment]:
+    pairs = (
+        combined[["customer", "material_group"]]
+        .dropna().drop_duplicates()
+        .sort_values(["customer", "material_group"])
+    )
+    segments = [Segment(row["customer"], row["material_group"]) for _, row in pairs.iterrows()]
+    if limit is not None:
+        segments = segments[:limit]
+    return segments
+
+
+def aggregate_segment_series(combined: pd.DataFrame, segment: Segment) -> pd.Series:
+    subset = combined.loc[
+        (combined["customer"] == segment.customer) & (combined["material_group"] == segment.material_group)
+    ]
+    if subset.empty:
+        return pd.Series(dtype=float)
+    s = subset.groupby("date")["net_pounds"].sum().sort_index()
+    s.index = pd.DatetimeIndex(s.index)
+    full_index = pd.date_range(s.index.min(), s.index.max(), freq="D")
+    return s.reindex(full_index)
+
+
+def historical_slice(dense_series: pd.Series, as_of_date: pd.Timestamp) -> pd.Series:
+    return dense_series.loc[dense_series.index <= as_of_date]
+
+
+def backlog_slice(dense_series: pd.Series, as_of_date: pd.Timestamp) -> pd.Series:
+    return dense_series.loc[dense_series.index > as_of_date]
+
+
+def modeling_series_for(historical: pd.Series) -> pd.Series:
+    """Interpolated for model fitting -- limit_direction='both' also fills a
+    sparse tail (no orders in the last few days before as_of) so the
+    modeling series always reaches all the way to as_of."""
+    return historical.interpolate(method="linear", limit_direction="both")
+
+
+def resolve_forecast_start(as_of: pd.Timestamp, align_to_sunday: bool) -> pd.Timestamp:
+    """See overall_forecast.py's version of this function -- kept identical
+    so both scripts anchor forecast dates the same way. Anchored to as_of
+    (not to any segment's own last actual observation), so every segment's
+    forecast covers the exact same calendar dates -- required for the wide
+    one-row-per-segment output to have consistent date columns."""
+    tomorrow = as_of + pd.Timedelta(days=1)
+    if not align_to_sunday:
+        return tomorrow
+    days_ahead = (6 - tomorrow.dayofweek) % 7
+    return tomorrow + pd.Timedelta(days=days_ahead)
+
+
+def sunday_start_dow(index: pd.DatetimeIndex) -> np.ndarray:
+    return (index.dayofweek + 1) % 7
+
+
+# =============================================================================
+# HistGradientBoostingRegressor (per-segment: no backtest, just fit + forecast)
+# =============================================================================
+
+def build_hgb_features(series: pd.Series) -> pd.DataFrame:
+    df = pd.DataFrame({"y": series.astype(float)})
+    df.index = pd.DatetimeIndex(df.index)
+    shifted = df["y"].shift(1)
+    for lag in LAG_DAYS:
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+    for window in ROLLING_WINDOWS:
+        df[f"roll_mean_{window}"] = shifted.rolling(window, min_periods=max(2, window // 2)).mean()
+    df["roll_std_7"] = shifted.rolling(7, min_periods=3).std()
+    dow, doy = sunday_start_dow(df.index), df.index.dayofyear
+    df["day_of_week"] = dow  # 0=Sunday ... 6=Saturday
+    df["is_weekend"] = ((dow == 0) | (dow == 6)).astype(int)
+    df["month"] = df.index.month
+    df["quarter"] = df.index.quarter
+    df["day_of_year"] = doy
+    df["weekly_sin"] = np.sin(2 * np.pi * dow / SEASONAL_PERIOD)
+    df["weekly_cos"] = np.cos(2 * np.pi * dow / SEASONAL_PERIOD)
+    df["annual_sin"] = np.sin(2 * np.pi * doy / ANNUAL_PERIOD)
+    df["annual_cos"] = np.cos(2 * np.pi * doy / ANNUAL_PERIOD)
+    return df
+
+
+def fit_hgb(train: pd.Series):
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    features = build_hgb_features(train.dropna())
+    rows = features.dropna(subset=HGB_FEATURE_COLUMNS)
+    if len(rows) < 30:
+        return None
+    model = HistGradientBoostingRegressor(random_state=RANDOM_SEED, min_samples_leaf=5)
+    model.fit(rows[HGB_FEATURE_COLUMNS].to_numpy(), rows["y"].to_numpy())
+    return model
+
+
+def predict_hgb(model, history: pd.Series, horizon: int, future_dates: List[pd.Timestamp]) -> np.ndarray:
+    if model is None:
+        return np.full(horizon, np.nan)
+    working = history.copy()
+    preds = []
+    for target_date in future_dates:
+        # bridge any gap between the segment's own data and the (shared,
+        # as_of-anchored) forecast start date, so recursive lag features
+        # stay well-defined even if this segment's history ends a bit early
+        working = working.reindex(pd.date_range(working.index.min(), target_date, freq="D"))
+        feats = build_hgb_features(working)
+        row = feats.loc[[target_date], HGB_FEATURE_COLUMNS].fillna(0.0)
+        pred = max(0.0, float(model.predict(row.to_numpy())[0]))
+        preds.append(pred)
+        working.loc[target_date] = pred
+    return np.array(preds)
+
+
+# =============================================================================
+# Seasonal Naive / AutoARIMA / AutoETS -- vectorized across ALL segments in
+# one call (no backtest -- one fit + forecast per segment, not eight).
+# =============================================================================
+
+def _build_statsforecast_models(fast_arima: bool, needed: List[str]):
+    from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive
+    models = []
+    if "Seasonal Naive" in needed:
+        models.append(SeasonalNaive(season_length=SEASONAL_PERIOD))
+    if "AutoARIMA" in needed:
+        arima_kwargs = dict(season_length=SEASONAL_PERIOD)
+        if fast_arima:
+            arima_kwargs.update(approximation=True, max_order=3, max_p=2, max_q=2, max_P=1, max_Q=1)
+        models.append(AutoARIMA(**arima_kwargs))
+    if "AutoETS" in needed:
+        models.append(AutoETS(season_length=SEASONAL_PERIOD))
+    return models
+
+
+_STATSFORECAST_COL_NAMES = {"SeasonalNaive": "Seasonal Naive", "AutoARIMA": "AutoARIMA", "AutoETS": "AutoETS"}
+
+
+def vectorized_forecast(
+    modeling_series_by_id: Dict[str, pd.Series], horizon: int, future_dates: List[pd.Timestamp],
+    fast_arima: bool, n_jobs: int, needed_models: List[str],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Fit-once-and-forecast for whichever of Seasonal Naive/AutoARIMA/
+    AutoETS are actually needed, across every eligible segment in one
+    vectorized statsforecast call. future_dates is the SAME shared,
+    as_of-anchored date range for every segment (see resolve_forecast_start)."""
+    from statsforecast import StatsForecast
+
+    needed = [m for m in needed_models if m in STATSFORECAST_MODELS]
+    if not needed:
+        return {}
+    eligible = {uid: s for uid, s in modeling_series_by_id.items() if len(s.dropna()) >= MIN_FIT_DAYS}
+    if not eligible:
+        return {}
+
+    panel = pd.concat(
+        [pd.DataFrame({"unique_id": uid, "ds": s.dropna().index, "y": s.dropna().values})
+         for uid, s in eligible.items()],
+        ignore_index=True,
+    )
+    sf = StatsForecast(models=_build_statsforecast_models(fast_arima, needed), freq="D", n_jobs=n_jobs)
+    try:
+        fc = sf.forecast(df=panel, h=horizon)
+    except Exception as exc:
+        log.warning("Vectorized forecast failed entirely: %s", exc)
+        return {}
+
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for uid in eligible:
+        sub = fc[fc["unique_id"] == uid].sort_values("ds")
+        if sub.empty or len(sub) < horizon:
+            continue
+        out[uid] = {}
+        for col, name in _STATSFORECAST_COL_NAMES.items():
+            if col in sub.columns:
+                out[uid][name] = np.maximum(sub[col].to_numpy()[:horizon], 0.0)
+    return out
+
+
+# =============================================================================
+# MAIN ORCHESTRATION
+# =============================================================================
+
+def run(
+    workbook_path: Union[str, Path], excel_out_path: Union[str, Path], model: str = "Average",
+    horizon: int = DEFAULT_HORIZON_DAYS, fast_arima: bool = False, n_jobs: int = -1,
+    limit: Optional[int] = None, as_of: Optional[pd.Timestamp] = None, align_to_sunday: bool = False,
+) -> None:
+    t_start = time.time()
+    if model not in MODEL_CHOICES:
+        raise ValueError(f"--model must be one of {MODEL_CHOICES}, got {model!r}.")
+    as_of = as_of or pd.Timestamp(date.today())
+    needed_models = MODEL_CHOICES[:-1] if model == "Average" else [model]  # "Average" needs all 4
+
+    log.info("Loading workbook: %s", workbook_path)
+    combined = load_and_clean_workbook(workbook_path)
+    segments = enumerate_segments(combined, limit=limit)
+    log.info("Enumerated %d customer/material segment(s). Output model: %s (needs: %s)",
+              len(segments), model, ", ".join(needed_models))
+
+    forecast_start = resolve_forecast_start(as_of, align_to_sunday)
+    future_dates = list(pd.date_range(forecast_start, periods=horizon, freq="D"))
+    log.info("Forecasting %s to %s (%d days).", future_dates[0].date(), future_dates[-1].date(), horizon)
+
+    log.info("Aggregating daily series for each segment...")
+    series_by_key: Dict[str, pd.Series] = {}
+    segment_by_key: Dict[str, Segment] = {}
+    modeling_by_key: Dict[str, pd.Series] = {}
+    backlog_by_key: Dict[str, pd.Series] = {}
+    for seg in segments:
+        s = aggregate_segment_series(combined, seg)
+        if s.dropna().empty:
+            continue
+        key = f"{seg.customer}||{seg.material_group}"
+        hist = historical_slice(s, as_of)
+        if hist.dropna().empty:
+            continue
+        series_by_key[key] = s
+        segment_by_key[key] = seg
+        modeling_by_key[key] = modeling_series_for(hist)
+        backlog_by_key[key] = backlog_slice(s, as_of)
+
+    log.info("Running vectorized forecast across %d segments for: %s",
+              len(modeling_by_key), [m for m in needed_models if m in STATSFORECAST_MODELS])
+    t0 = time.time()
+    sf_results = vectorized_forecast(modeling_by_key, horizon, future_dates, fast_arima, n_jobs, needed_models)
+    log.info("Vectorized forecast done in %.1fs.", time.time() - t0)
+
+    need_hgb = "HistGradientBoostingRegressor" in needed_models
+    rows = []
+    n_ok = n_skipped = 0
+    t0 = time.time()
+    for i, key in enumerate(modeling_by_key, start=1):
+        seg = segment_by_key[key]
+        modeling = modeling_by_key[key]
+        backlog = backlog_by_key[key]
+
+        model_values: Dict[str, np.ndarray] = dict(sf_results.get(key, {}))
+        if need_hgb:
+            hgb_model = fit_hgb(modeling)
+            model_values["HistGradientBoostingRegressor"] = predict_hgb(hgb_model, modeling, horizon, future_dates)
+
+        per_day = []
+        ok = True
+        for d_idx, d in enumerate(future_dates):
+            backlog_val = float(backlog.get(d, 0.0)) if not pd.isna(backlog.get(d, 0.0)) else 0.0
+            vals = []
+            for name in needed_models:
+                raw = model_values.get(name)
+                if raw is not None and d_idx < len(raw) and not np.isnan(raw[d_idx]):
+                    vals.append(max(float(raw[d_idx]), backlog_val))  # backlog is a floor
+            if not vals:
+                ok = False
+                break
+            per_day.append(float(np.mean(vals)) if model == "Average" else vals[0])
+
+        if not ok:
+            n_skipped += 1
+            continue
+        row = {"customer": seg.customer, "material_group": seg.material_group}
+        row.update({d.strftime("%Y-%m-%d"): v for d, v in zip(future_dates, per_day)})
+        rows.append(row)
+        n_ok += 1
+        if i % 500 == 0 or i == len(modeling_by_key):
+            log.info("  ...%d/%d segments processed (ok=%d, skipped=%d) in %.1fs",
+                      i, len(modeling_by_key), n_ok, n_skipped, time.time() - t0)
+
+    date_cols = [d.strftime("%Y-%m-%d") for d in future_dates]
+    result_df = pd.DataFrame(rows, columns=["customer", "material_group"] + date_cols)
+    write_excel(result_df, model, future_dates, excel_out_path)
+    log.info(
+        "Done in %.1fs total. %d segment(s) forecast, %d skipped (insufficient history). Wrote %s.",
+        time.time() - t_start, n_ok, n_skipped, excel_out_path,
+    )
+
+
+def write_excel(result_df: pd.DataFrame, model: str, future_dates: List[pd.Timestamp],
+                 out_path: Union[str, Path]) -> None:
+    from openpyxl.styles import Font
+
+    date_cols = [d.strftime("%Y-%m-%d") for d in future_dates]
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        result_df.to_excel(writer, sheet_name="Forecast", index=False)
+        ws = writer.sheets["Forecast"]
+        for col_i in range(3, len(date_cols) + 3):
+            for row_i in range(2, len(result_df) + 2):
+                ws.cell(row=row_i, column=col_i).number_format = "#,##0"
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+        info = pd.DataFrame([
+            {"field": "model", "value": model},
+            {"field": "horizon_days", "value": len(future_dates)},
+            {"field": "forecast_start", "value": future_dates[0].date().isoformat()},
+            {"field": "forecast_end", "value": future_dates[-1].date().isoformat()},
+            {"field": "generated_at", "value": pd.Timestamp.now().isoformat(timespec="seconds")},
+        ])
+        info.to_excel(writer, sheet_name="Run Info", index=False)
+        for cell in writer.sheets["Run Info"][1]:
+            cell.font = Font(bold=True)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--workbook", default="Sales Order 2024-26.xlsx", help="Path to the Sales Order workbook.")
+    p.add_argument("--excel-out", default="customer_material_forecast.xlsx", help="Output Excel file.")
+    p.add_argument("--model", default="Average", choices=MODEL_CHOICES,
+                    help="Which forecast to output. 'Average' needs all 4 models computed (slowest).")
+    p.add_argument("--horizon", type=int, default=DEFAULT_HORIZON_DAYS, help="Forecast horizon in days.")
+    p.add_argument("--align-to-sunday", action="store_true",
+                    help="Start the forecast on the next Sunday on/after as-of instead of tomorrow.")
+    arima_group = p.add_mutually_exclusive_group()
+    arima_group.add_argument("--thorough-arima", action="store_true", default=True,
+                              help="Full AutoARIMA search (default here, since there's no backtest to multiply the cost by).")
+    arima_group.add_argument("--fast-arima", action="store_true",
+                              help="Reduced AutoARIMA search -- ~5-6x faster, modest accuracy tradeoff.")
+    p.add_argument("--n-jobs", type=int, default=-1, help="CPU cores for the vectorized forecast call (-1 = all).")
+    p.add_argument("--limit", type=int, default=None, help="Only process the first N segments (quick timing test).")
+    p.add_argument("--as-of", default=None, help="Historical cutoff date (YYYY-MM-DD). Defaults to today.")
+    return p
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+    as_of = pd.Timestamp(args.as_of) if args.as_of else None
+    run(
+        workbook_path=args.workbook, excel_out_path=args.excel_out, model=args.model,
+        horizon=args.horizon, fast_arima=args.fast_arima, n_jobs=args.n_jobs, limit=args.limit,
+        as_of=as_of, align_to_sunday=args.align_to_sunday,
+    )
+
+
+if __name__ == "__main__":
+    main()
